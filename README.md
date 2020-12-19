@@ -18,3 +18,14 @@ See its docs: https://godoc.org/inet.af/netaddr
 * merges net.IPAddr and net.IP (which the Go net package is a little torn between for legacy reasons)
 * ...
 * TODO: finish this list
+
+## Testing
+
+In addition to regular Go tests, netaddr uses fuzzing.
+To use:
+
+```
+$ go get -u github.com/dvyukov/go-fuzz/go-fuzz github.com/dvyukov/go-fuzz/go-fuzz-build
+$ go-fuzz-build && go-fuzz
+```
+
