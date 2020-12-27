@@ -124,43 +124,23 @@ func IPFrom16(addr [16]byte) IP {
 // s can be in dotted decimal ("192.0.2.1"), IPv6 ("2001:db8::68"),
 // or IPv6 with a scoped addressing zone ("fe80::1cc0:3e8c:119f:c2e1%ens18").
 func ParseIP(s string) (IP, error) {
-	// IPv4 fast path.
-	if ip, ok := parseIPv4(s); ok {
-		return ip, nil
-	}
-
-	var ipa net.IPAddr
-	ipa.IP = net.ParseIP(s)
-	if ipa.IP == nil {
-		switch percent := strings.Index(s, "%"); percent {
-		case -1:
-			// handle bad input with no % at all, so the net.ParseIP was not due to a zoned IPv6 fail
-			return IP{}, fmt.Errorf("netaddr.ParseIP(%q): unable to parse IP", s)
-		case 0:
-			// handle bad input with % at the start
-			return IP{}, fmt.Errorf("netaddr.ParseIP(%q): missing IPv6 address", s)
-		case len(s) - 1:
-			// handle bad input with % at the end
-			return IP{}, fmt.Errorf("netaddr.ParseIP(%q): missing zone", s)
-		default:
-			// net.ParseIP can't deal with zoned scopes, let's split and try to parse the IP again
-			s, ipa.Zone = s[:percent], s[percent+1:]
-			ipa.IP = net.ParseIP(s)
-			if ipa.IP == nil {
-				return IP{}, fmt.Errorf("netaddr.ParseIP(%q): unable to parse IP", s)
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '.':
+			ip, ok := parseIPv4(s)
+			if !ok {
+				return IP{}, errors.New("unable to parse IP")
 			}
+			return ip, nil
+		case ':':
+			ip, ok := parseIPv6(s)
+			if !ok {
+				return IP{}, errors.New("unable to parse IP")
+			}
+			return ip, nil
 		}
 	}
-
-	if !strings.Contains(s, ":") {
-		if ip4 := ipa.IP.To4(); ip4 != nil {
-			if ipa.Zone != "" {
-				return IP{}, fmt.Errorf("netaddr.ParseIP(%q): invalid zone with IPv4 address", s)
-			}
-			return IPv4(ip4[0], ip4[1], ip4[2], ip4[3]), nil
-		}
-	}
-	return ipv6Slice(ipa.IP.To16()).WithZone(ipa.Zone), nil
+	return IP{}, errors.New("unable to parse IP")
 }
 
 // MustParseIP calls ParseIP(s) and panics on error.
@@ -224,6 +204,139 @@ func parseIPv4(s string) (ip IP, ok bool) {
 	}
 
 	return IPv4(ip4[0], ip4[1], ip4[2], ip4[3]), true
+}
+
+func parseIPv6(s string) (IP, bool) {
+	// Split off the zone right from the start. Yes it's a second scan
+	// of the string, but trying to handle it inline makes a bunch of
+	// other inner loop conditionals more expensive, and it ends up
+	// being slower.
+	zone := ""
+	i := strings.IndexByte(s, '%')
+	if i != -1 {
+		s, zone = s[:i], s[i+1:]
+		if zone == "" {
+			// Not allowed to have an empty zone if explicitly specified.
+			return IP{}, false
+		}
+	}
+
+	var ip [16]byte
+	ellipsis := -1 // position of ellipsis in ip
+
+	// Might have leading ellipsis
+	if len(s) >= 2 && s[0] == ':' && s[1] == ':' {
+		ellipsis = 0
+		s = s[2:]
+		// Might be only ellipsis
+		if len(s) == 0 {
+			return IPv6Unspecified().WithZone(zone), true
+		}
+	}
+
+	// Loop, parsing hex numbers followed by colon.
+	i = 0
+	for i < 16 {
+		// Hex number. Similar to parseIPv4, inlining the hex number
+		// parsing yields a significant performance increase.
+		off := 0
+		acc := uint32(0)
+		for ; off < len(s); off++ {
+			c := s[off]
+			if c >= '0' && c <= '9' {
+				acc = (acc << 4) + uint32(c-'0')
+			} else if c >= 'a' && c <= 'f' {
+				acc = (acc << 4) + uint32(c-'a'+10)
+			} else if c >= 'A' && c <= 'F' {
+				acc = (acc << 4) + uint32(c-'A'+10)
+			} else {
+				break
+			}
+			if acc > maxUint16 {
+				// Overflow, fail.
+				return IP{}, false
+			}
+		}
+		if off == 0 {
+			// No digits found, fail.
+			return IP{}, false
+		}
+
+		// If followed by dot, might be in trailing IPv4.
+		if off < len(s) && s[off] == '.' {
+			if ellipsis < 0 && i != 12 {
+				// Not the right place.
+				return IP{}, false
+			}
+			if i+4 > 16 {
+				// Not enough room.
+				return IP{}, false
+			}
+			ip4, ok := parseIPv4(s)
+			if !ok {
+				return IP{}, false
+			}
+			ip[i] = ip4.v4(0)
+			ip[i+1] = ip4.v4(1)
+			ip[i+2] = ip4.v4(2)
+			ip[i+3] = ip4.v4(3)
+			s = ""
+			i += 4
+			break
+		}
+
+		// Save this 16-bit chunk.
+		ip[i] = byte(acc >> 8)
+		ip[i+1] = byte(acc)
+		i += 2
+
+		// Stop at end of string.
+		s = s[off:]
+		if len(s) == 0 {
+			break
+		}
+
+		// Otherwise must be followed by colon and more.
+		if s[0] != ':' || len(s) == 1 {
+			return IP{}, false
+		}
+		s = s[1:]
+
+		// Look for ellipsis.
+		if s[0] == ':' {
+			if ellipsis >= 0 { // already have one
+				return IP{}, false
+			}
+			ellipsis = i
+			s = s[1:]
+			if len(s) == 0 { // can be at end
+				break
+			}
+		}
+	}
+
+	// Must have used entire string.
+	if len(s) != 0 {
+		return IP{}, false
+	}
+
+	// If didn't parse enough, expand ellipsis.
+	if i < 16 {
+		if ellipsis < 0 {
+			return IP{}, false
+		}
+		n := 16 - i
+		for j := i - 1; j >= ellipsis; j-- {
+			ip[j+n] = ip[j]
+		}
+		for j := ellipsis + n - 1; j >= ellipsis; j-- {
+			ip[j] = 0
+		}
+	} else if ellipsis >= 0 {
+		// Ellipsis must represent at least one 0 group.
+		return IP{}, false
+	}
+	return IPv6Raw(ip).WithZone(zone), true
 }
 
 // FromStdIP returns an IP from the standard library's IP type.
